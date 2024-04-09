@@ -1,4 +1,4 @@
-module github.com/toastcheng/dicomweb-go
+module github.com/bakhdaulet/dicomweb-go
 
 go 1.12
 
