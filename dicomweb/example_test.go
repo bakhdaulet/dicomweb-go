@@ -2,11 +2,10 @@ package dicomweb_test
 
 import (
 	"fmt"
+	"github.com/bakhdaulet/dicomweb-go/dicomweb"
 	"io/ioutil"
 	"log"
 	"strconv"
-
-	"github.com/toastcheng/dicomweb-go/dicomweb"
 )
 
 func ExampleClient_Query_allStudy() {
