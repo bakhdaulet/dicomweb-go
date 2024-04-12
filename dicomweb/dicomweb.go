@@ -16,6 +16,8 @@ import (
 	"net/textproto"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/philippfranke/multipart-related/related"
 )
@@ -25,13 +27,19 @@ import (
 // https://www.dicomstandard.org/wp-content/uploads/2018/04/DICOMweb-Cheatsheet.pdf
 // for more detail.
 type Client struct {
-	httpClient    *http.Client
-	qidoEndpoint  string
-	wadoEndpoint  string
-	stowEndpoint  string
-	authorization string
-	boundary      string
-	optionFuncs *[]OptionFunc
+	httpClient     *http.Client
+	qidoEndpoint   string
+	wadoEndpoint   string
+	stowEndpoint   string
+	authorization  string
+	clientId       string
+	secret         string
+	tenantId       string
+	boundary       string
+	accessToken    string
+	expirationTime time.Time
+	cacheMutex     sync.RWMutex
+	optionFuncs    *[]OptionFunc
 }
 
 // OptionFunc is a signature for methods which can modify dicom requests
@@ -60,6 +68,81 @@ func (c *Client) WithAuthentication(auth string) *Client {
 	return c
 }
 
+func (c *Client) getAccessToken() error {
+	c.cacheMutex.RLock()
+	if c.accessToken != "" && c.expirationTime.After(time.Now()) {
+		defer c.cacheMutex.RUnlock()
+		authStr := "Bearer " + c.accessToken
+		c.authorization = authStr
+		return nil
+	}
+	c.cacheMutex.RUnlock()
+
+	// If the cached token is expired or not present, request a new one
+	c.cacheMutex.Lock()
+	defer c.cacheMutex.Unlock()
+
+	// Check again in case another goroutine has updated the token while this one was waiting for the lock
+	if c.accessToken != "" && c.expirationTime.After(time.Now()) {
+		authStr := "Bearer " + c.accessToken
+		c.authorization = authStr
+		return nil
+	}
+
+	url := "https://login.microsoftonline.com/" + c.tenantId + "/oauth2/token"
+	method := "POST"
+
+	payload := strings.NewReader("grant_type=client_credentials&client_id=" + c.clientId + "&client_secret=" + c.secret + "&resource=https://dicom.healthcareapis.azure.com")
+
+	client := &http.Client{}
+	req, err := http.NewRequest(method, url, payload)
+	if err != nil {
+		return err
+	}
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
+
+	var response map[string]interface{}
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		return err
+	}
+
+	newAccessToken, ok := response["access_token"].(string)
+	if !ok {
+		return fmt.Errorf("access token not found in response")
+	}
+
+	expiresIn, err := time.ParseDuration(response["expires_in"].(string) + "s")
+	if err != nil {
+		return err
+	}
+
+	c.accessToken = newAccessToken
+	c.expirationTime = time.Now().Add(expiresIn)
+	authStr := "Bearer " + c.accessToken
+	c.authorization = authStr
+	return nil
+}
+
+// WithAuthentication configures the client.
+func (c *Client) WithAuthenticationClientSecret(clientId, secret, tenantid string) *Client {
+	c.clientId = clientId
+	c.secret = secret
+	c.tenantId = tenantid
+	return c
+}
+
 // WithInsecure create a http client that skip verifying, do not use it in production.
 func (c *Client) WithInsecure() *Client {
 	tr := &http.Transport{
@@ -78,7 +161,7 @@ func NewClient(option ClientOption) *Client {
 	}
 	return &Client{
 		httpClient:   httpClient,
-		optionFuncs: option.OptionFuncs,
+		optionFuncs:  option.OptionFuncs,
 		qidoEndpoint: option.QIDOEndpoint,
 		wadoEndpoint: option.WADOEndpoint,
 		stowEndpoint: option.STOWEndpoint,
@@ -125,7 +208,12 @@ func (c *Client) Query(req QIDORequest) ([]QIDOResponse, error) {
 	}
 
 	r.URL.RawQuery = q.Encode()
-
+	if c.clientId != "" {
+		err = c.getAccessToken()
+		if err != nil {
+			return nil, err
+		}
+	}
 	if c.authorization != "" {
 		r.Header.Set("Authorization", c.authorization)
 	}
@@ -312,6 +400,13 @@ func (c *Client) Store(req STOWRequest) (interface{}, error) {
 	// The RFC 2045 doc states that certain values cannot be used as parameter values in the Content-Type header,
 	// which includes '/', so the `application/dicom` needs to be wrapped by double quotes.
 	r.Header.Set("Content-Type", fmt.Sprintf("multipart/related; type=\"application/dicom\"; boundary=%s", c.boundary))
+	r.Header.Set("Accept", "application/dicom+json")
+	if c.clientId != "" {
+		err = c.getAccessToken()
+		if err != nil {
+			return nil, err
+		}
+	}
 	if c.authorization != "" {
 		r.Header.Set("Authorization", c.authorization)
 	}
@@ -330,8 +425,66 @@ func (c *Client) Store(req STOWRequest) (interface{}, error) {
 		return nil, err
 	}
 
-	var result interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if resp != nil && resp.StatusCode != 200 {
+		return nil, errors.New("status = " + resp.Status)
+	}
+
+	var result STOWResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	// Convert the map to a JSON string
+	//jsonResult, err := json.Marshal(result)
+	//if err != nil {
+	//	return "", err
+	//}
+	//fmt.Println(result)
+	//if len(result.SuccessResponse.Value) < 1 {
+	//	return "", errors.New("not load")
+	//}
+	//result.GetStudyies()
 
 	return result, nil
+}
+
+type STOWResponse struct {
+	ErrorResponse struct {
+		Value []struct {
+			ReferencedSOPClassUID struct {
+				Value []string `json:"Value"`
+				Vr    string   `json:"vr"`
+			} `json:"00081150"`
+			ReferencedSOPInstanceUID struct {
+				Value []string `json:"Value"`
+				Vr    string   `json:"vr"`
+			} `json:"00081155"`
+			FailureReason struct {
+				Value []int  `json:"Value"`
+				Vr    string `json:"vr"`
+			} `json:"00081197"`
+		} `json:"Value"`
+		Vr string `json:"vr"`
+	} `json:"00081198"`
+
+	SuccessResponse struct {
+		Value []struct {
+			ReferencedSOPClassUID struct {
+				Value []string `json:"Value"`
+				Vr    string   `json:"vr"`
+			} `json:"00081150"`
+			ReferencedSOPInstanceUID struct {
+				Value []string `json:"Value"`
+				Vr    string   `json:"vr"`
+			} `json:"00081155"`
+			RetrieveURL struct {
+				Value []string `json:"Value"`
+				Vr    string   `json:"vr"`
+			} `json:"00081190"`
+			FailedAttributesSequence struct {
+				Vr string `json:"vr"`
+			} `json:"00741048"`
+		} `json:"Value"`
+		Vr string `json:"vr"`
+	} `json:"00081199"`
 }
