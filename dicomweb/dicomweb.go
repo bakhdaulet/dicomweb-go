@@ -135,6 +135,11 @@ func (c *Client) getAccessToken() error {
 	return nil
 }
 
+func (c *Client) GetAuth() string {
+	c.getAccessToken()
+	return c.authorization
+}
+
 // WithAuthentication configures the client.
 func (c *Client) WithAuthenticationClientSecret(clientId, secret, tenantid string) *Client {
 	c.clientId = clientId
@@ -185,25 +190,46 @@ func (c *Client) Query(req QIDORequest) ([]QIDOResponse, error) {
 	default:
 		return nil, errors.New("failed to query: need to specify query type")
 	}
-
 	r, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
+	r.Header.Set("Accept", "application/dicom+json")
+
 	q := r.URL.Query()
 	mp := map[string]interface{}{}
 	databytes, _ := json.Marshal(req)
 	json.Unmarshal(databytes, &mp)
 
 	for k, v := range mp {
-		if k == "Type" || k == "0020000D" || k == "0020000E" || k == "00080018" {
+		//if k == "Type" || k == "0020000D" || k == "0020000E" || k == "00080018" {
+		//	continue
+		//}
+		if k == "Type" || k == "0020000E" || k == "00080018" {
 			continue
 		}
+
 		switch t := v.(type) {
 		case float64:
 			q.Add(k, fmt.Sprintf("%.0f", t))
 		case string:
 			q.Add(k, t)
+		case []interface{}:
+			var l string
+			for i, interfaceValue := range t {
+				switch t1 := interfaceValue.(type) {
+				case string:
+					l += t1
+					if i < len(t)-1 {
+						l += ","
+					}
+				}
+			}
+
+			//for _, _ := range t {
+			//	l += s + ","
+			//}
+			q.Add(k, l)
 		}
 	}
 
@@ -233,6 +259,13 @@ func (c *Client) Query(req QIDORequest) ([]QIDOResponse, error) {
 	}
 	defer resp.Body.Close()
 
+	//b, err := io.ReadAll(resp.Body)
+	//if err != nil {
+	//	log.Fatalln(err)
+	//}
+	//
+	//fmt.Println(string(b))
+
 	if resp.StatusCode/100 != 2 {
 		return nil, errors.New(resp.Status)
 	}
@@ -253,6 +286,9 @@ func (c *Client) Retrieve(req WADORequest) ([][]byte, error) {
 	switch req.Type {
 	case StudyRaw:
 		url += "/studies/" + req.StudyInstanceUID
+	//case StudyMetadata:
+	//	url += "/studies/" + req.StudyInstanceUID
+	//	url += "/metadata"
 	case StudyRendered:
 		url += "/studies/" + req.StudyInstanceUID
 		url += "/rendered"
@@ -294,6 +330,13 @@ func (c *Client) Retrieve(req WADORequest) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	r.Header.Set("Accept", "application/dicom+json")
+	if c.clientId != "" {
+		err = c.getAccessToken()
+		if err != nil {
+			return nil, err
+		}
+	}
 	if c.authorization != "" {
 		r.Header.Set("Authorization", c.authorization)
 	}
@@ -319,13 +362,13 @@ func (c *Client) Retrieve(req WADORequest) ([][]byte, error) {
 	}
 
 	parts := [][]byte{}
-	mediaType, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	_, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if err != nil {
 		return nil, err
 	}
-	if !strings.HasPrefix(mediaType, "multipart/") {
-		return nil, errors.New("unexpected Content-Type, should be multipart/related")
-	}
+	//if !strings.HasPrefix(mediaType, "multipart/") {
+	//	return nil, errors.New("unexpected Content-Type, should be multipart/related")
+	//}
 
 	if params["start"] == "" {
 		mr := multipart.NewReader(resp.Body, params["boundary"])
@@ -364,7 +407,7 @@ func (c *Client) Retrieve(req WADORequest) ([][]byte, error) {
 }
 
 // Store based on STOW, store the DICOM study to PACS server.
-func (c *Client) Store(req STOWRequest) (interface{}, error) {
+func (c *Client) Store(req STOWRequest) (*STOWResponse, error) {
 	url := c.stowEndpoint + "/studies/"
 
 	if req.StudyInstanceUID != "" {
@@ -392,7 +435,7 @@ func (c *Client) Store(req STOWRequest) (interface{}, error) {
 		return nil, err
 	}
 
-	r, err := http.NewRequest("POST", url, body)
+	r, err := http.NewRequest("PUT", url, body)
 	if err != nil {
 		return nil, err
 	}
@@ -425,27 +468,17 @@ func (c *Client) Store(req STOWRequest) (interface{}, error) {
 		return nil, err
 	}
 
-	if resp != nil && resp.StatusCode != 200 {
+	if resp != nil && resp.StatusCode != 200 && resp.StatusCode != 202 {
 		return nil, errors.New("status = " + resp.Status)
 	}
 
 	var result STOWResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return nil, err
 	}
+	fmt.Println(result)
 
-	// Convert the map to a JSON string
-	//jsonResult, err := json.Marshal(result)
-	//if err != nil {
-	//	return "", err
-	//}
-	//fmt.Println(result)
-	//if len(result.SuccessResponse.Value) < 1 {
-	//	return "", errors.New("not load")
-	//}
-	//result.GetStudyies()
-
-	return result, nil
+	return &result, nil
 }
 
 type STOWResponse struct {

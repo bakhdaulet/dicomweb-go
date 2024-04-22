@@ -20,6 +20,8 @@ func (r WADORequest) Validate() bool {
 	switch r.Type {
 	case StudyRaw:
 		return r.StudyInstanceUID != "" && r.SeriesInstanceUID == "" && r.SOPInstanceUID == ""
+	//case StudyMetadata:
+	//	return r.StudyInstanceUID != "" && r.SeriesInstanceUID == "" && r.SOPInstanceUID == ""
 	case StudyRendered:
 		return r.StudyInstanceUID != "" && r.SeriesInstanceUID == "" && r.SOPInstanceUID == ""
 	case SeriesRaw:
@@ -48,6 +50,8 @@ type WADOType int
 const (
 	// StudyRaw raw study.
 	StudyRaw WADOType = iota + 1
+	//STudyMetadata
+	//StudyMetadata
 	// StudyRendered rendered study.
 	StudyRendered
 	// SeriesRaw raw series.
